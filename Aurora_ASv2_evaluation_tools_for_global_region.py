@@ -17,6 +17,11 @@ import sys
 from operator import itemgetter
 import matplotlib.pyplot as plt
 import numpy as np
+import concurrent.futures
+from botocore.exceptions import ClientError
+
+priceList = []
+counter = 0
 
 IMG_WIDTH = 600
 IMG_HEIGHT = 400
@@ -56,8 +61,7 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-
-def get_cpu_utilization(instance_id, region='us-east-1', stat='Average'):
+def get_cpu_utilization(instance_id, region):
     """
     获取给定 RDS 实例在最近一周内的 CPU 使用率统计信息。
 
@@ -69,12 +73,12 @@ def get_cpu_utilization(instance_id, region='us-east-1', stat='Average'):
     返回:
     float: CPU 使用率百分比
     """
-    cloudwatch = boto3.client('cloudwatch', region_name=rds_region)
+    cloudwatch_client = boto3.client('cloudwatch', region_name=rds_region)
 
-    response = cloudwatch.get_metric_data(
+    response = cloudwatch_client.get_metric_data(
         MetricDataQueries=[
             {
-                'Id': 'cpu',
+                'Id': 'cpu_avg',
                 'MetricStat': {
                     'Metric': {
                         'Namespace': 'AWS/RDS',
@@ -86,64 +90,219 @@ def get_cpu_utilization(instance_id, region='us-east-1', stat='Average'):
                             }
                         ]
                     },
-                    'Period': 86400*31,
-                    'Stat': stat
+                    'Period': 86400 * 31,  # 注意：这么大的周期可能会导致数据点不足
+                    'Stat': 'Average'
                 },
                 'ReturnData': True
+            },
+            {
+                'Id': 'cpu_min',
+                'MetricStat': {
+                    'Metric': {
+                        'Namespace': 'AWS/RDS',
+                        'MetricName': 'CPUUtilization',
+                        'Dimensions': [
+                            {
+                                'Name': 'DBInstanceIdentifier',
+                                'Value': instance_id
+                            }
+                        ]
+                    },
+                    'Period': 86400 * 31,
+                    'Stat': 'Minimum'
+                },
+                'ReturnData': True
+            },
+            {
+                'Id': 'cpu_max',
+                'MetricStat': {
+                    'Metric': {
+                        'Namespace': 'AWS/RDS',
+                        'MetricName': 'CPUUtilization',
+                        'Dimensions': [
+                            {
+                                'Name': 'DBInstanceIdentifier',
+                                'Value': instance_id
+                            }
+                        ]
+                    },
+                    'Period': 86400 * 31,
+                    'Stat': 'Maximum'
+                },
+                'ReturnData': True
+            },
+            {
+                'Id': 'cpu_percent',
+                'Expression': 'IF(m1>0,m1)',  # 修正：移除 f-string（不需要）
+                'Label': 'CPU Watch',
+                'ReturnData': True  # 添加缺失的 ReturnData
+            },
+            {
+                'Id': 'm1',
+                'MetricStat': {
+                    'Metric': {
+                        'Namespace': 'AWS/RDS',
+                        'MetricName': 'CPUUtilization',
+                        'Dimensions': [
+                            {
+                                'Name': 'DBInstanceIdentifier',
+                                'Value': instance_id
+                            }
+                        ]
+                    },
+                    'Period': 60,  # 每分钟一个数据点（更合理）
+                    'Stat': 'Maximum',
+                    'Unit': 'Percent'
+                },
+                'ReturnData': False
             }
         ],
-        StartTime=datetime.utcnow() - timedelta(days=30),
-        EndTime=datetime.utcnow()
+        # 修正参数名称为 CamelCase
+        StartTime=(datetime.utcnow() - timedelta(days=30)).isoformat() + 'Z',
+        EndTime=datetime.utcnow().isoformat() + 'Z'
     )
 
-    #print(f"{instance_id}:{response['MetricDataResults']}")
     if response['MetricDataResults']:
-        cpu_utilization = math.ceil(response['MetricDataResults'][0]['Values'][0])
-        #print(cpu_utilization)
-        return cpu_utilization
+        metrics = {}
+        for mdr in response['MetricDataResults']:
+            metrics[mdr['Id']] = {'timestamps': mdr['Timestamps'], 'values': mdr['Values']}
+        return metrics
     else:
         return None
 
+def pricing_get_product(engine, serverless=False, productFamily=None, instance_class=None):
+    global priceList
+    logging.info(f"查找价格: instance_class={instance_class}, serverless={serverless}, engine={engine}, productFamily={productFamily}")
+    for price in priceList:
+        if serverless:
+            if (price['product']['productFamily'] == productFamily and price['product']['attributes']['databaseEngine'].lower() == engine.lower() and 'IOOptimizedUsage' not in price['product']['attributes'].get('usagetype', '')):
+                return price
+        else:
+            if (price['product']['productFamily'] == 'Database Instance'and price['product']['attributes']['databaseEngine'].lower() == engine.lower() and price['product']['attributes']['instanceType'] == instance_class):
+                return price
+    logging.error(f'param: engine={engine}, serverless={serverless}, productFamily={productFamily}, instanceType={instance_class}')
+    logging.info(f'priceList Dump: {json.dumps(priceList, indent=2)}')
+    raise Exception('price not found')
 
-def get_aurora_serverless_acu_price(engine):
+def get_aurora_serverless_acu_price(engine,rds_region):
     """
     Retrieves the price per ACU-Hour for Aurora Serverless.
-
     Returns:
         float: The price per ACU-Hour for Aurora Serverless.
     """
     ## Q1:把 RDS 的 PG 和 MySQL 都替换为 Aurora PG 和 MySQL 是为了完成 RDS --> Aurora 的成本核算
 
     # Create a Pricing client 初始化 API
-    pricing = boto3.client('pricing',region_name='us-east-1')
+
     if engine == "PostgreSQL":
         engine=engine.replace("PostgreSQL","Aurora PostgreSQL")
     if engine == "mysql":
         engine=engine.replace("mysql","Aurora MySQL")
-
+    
     logging.info(f"acu price engine search: {engine}")
-    # Define the parameters for the API request
-    response = pricing.get_products(
-        ServiceCode='AmazonRDS',
-        Filters=[
-            {'Type': 'TERM_MATCH','Field': 'productFamily','Value': 'ServerlessV2'},
-            {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': aws_region_to_location(rds_region)},
+    response = pricing_get_product(engine=engine, serverless=True, productFamily='ServerlessV2')
+    for offer_term_code, offer_term_data in response["terms"]["OnDemand"].items():
+        for price_dimension_key, price_dimension_data in offer_term_data["priceDimensions"].items():
+            price_per_unit = float(price_dimension_data["pricePerUnit"]["USD"])
+            return price_per_unit        
+
+def get_all_pages(pricing_client, service_code, filters, max_retries=5):
+    """
+    分页获取 AWS Pricing API 的所有结果
+    :param pricing_client: boto3 Pricing 客户端
+    :param service_code: 服务代码（如 'AmazonRDS'）
+    :param filters: 筛选条件列表
+    :param max_retries: 最大重试次数（处理限流）
+    :return: 包含所有页结果的列表
+    """
+    all_results = []
+    next_token = None
+    retries = 0
+    
+    while True:
+        try:
+            # 构建请求参数
+            params = {
+                'ServiceCode': service_code,
+                'Filters': filters
+            }
+            if next_token:
+                params['NextToken'] = next_token
+            
+            # 执行请求
+            response = pricing_client.get_products(**params)
+            all_results.extend(response['PriceList'])
+            
+            # 检查是否有下一页
+            if 'NextToken' in response:
+                next_token = response['NextToken']
+            else:
+                break
+                
+            # 避免过快请求
+            time.sleep(0.5)
+            
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'Throttling':
+                retries += 1
+                if retries > max_retries:
+                    logging.error(f"达到最大重试次数: {e}")
+                    break
+                wait_time = 2 ** retries  # 指数退避：2s, 4s, 8s...
+                logging.warning(f"请求被限流，{wait_time}秒后重试 ({retries}/{max_retries})")
+                time.sleep(wait_time)
+            else:
+                logging.error(f"API 请求错误: {e}")
+                break
+    
+    logging.info(f"获取了 {len(all_results)} 条价格数据")
+    return all_results
+
+def pricing_get_products_optimized(rds_region):
+    """
+    获取指定区域的 RDS 价格信息（包括 Serverless 和标准实例）
+    :param rds_region: 区域名称（如 'ap-northeast-1'）
+    :return: 无（结果存储在全局变量 priceList 中）
+    """
+    global priceList
+    priceList = []  # 重置全局价格列表
+    
+    # 创建 Pricing 客户端（必须使用 us-east-1）
+    pricing_client = boto3.client('pricing', region_name='us-east-1')
+    location = aws_region_to_location(rds_region)
+    
+    # 获取 Serverless V2 价格
+    logging.info(f"开始获取 Aurora Serverless V2 ({rds_region}) 的价格")
+    serverless_engines = ['Aurora MySQL', 'Aurora PostgreSQL']
+    
+    for engine in serverless_engines:
+        filters = [
+            {'Type': 'TERM_MATCH', 'Field': 'productFamily', 'Value': 'ServerlessV2'},
+            {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': location},
             {'Type': 'TERM_MATCH', 'Field': 'databaseEngine', 'Value': engine}
         ]
-    )
-
-    #product_json = json.loads(response['PriceList'][0])
-    #logging.info(json.dumps(product_json, indent=4))
-    # Extract the price information
-    price_count = 0
-    for price_list_item in response['PriceList']:
-        product_json = json.loads(price_list_item)
-        usagetype = product_json['product']['attributes'].get('usagetype', '')
-        if 'IOOptimizedUsage' not in usagetype:
-            for offer_term_code, offer_term_data in product_json["terms"]["OnDemand"].items():
-                for price_dimension_key, price_dimension_data in offer_term_data["priceDimensions"].items():
-                    price_per_unit = float(price_dimension_data["pricePerUnit"]["USD"])
-                    return price_per_unit
+        
+        products = get_all_pages(pricing_client, 'AmazonRDS', filters)
+        for product in products:
+            priceList.append(json.loads(product))
+    
+    # 获取标准实例价格
+    logging.info(f"开始获取标准 RDS 实例 ({rds_region}) 的价格")
+    standard_engines = ['Aurora MySQL', 'Aurora PostgreSQL', 'MySql', 'PostgreSQL']
+    
+    for engine in standard_engines:
+        filters = [
+            {'Type': 'TERM_MATCH', 'Field': 'databaseEngine', 'Value': engine},
+            {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': location},
+            {'Type': 'TERM_MATCH', 'Field': 'deploymentOption', 'Value': 'Single-AZ'},
+            {'Type': 'TERM_MATCH', 'Field': 'storage', 'Value': 'EBS Only'}
+        ]
+        
+        products = get_all_pages(pricing_client, 'AmazonRDS', filters)
+        for product in products:
+            priceList.append(json.loads(product))
+    
+    logging.info(f"完成所有价格获取，共收集 {len(priceList)} 条价格数据")
 
 def count_cpu_usage_distribution(cpu_usage_data):
     """
@@ -183,11 +342,12 @@ def count_cpu_usage_distribution(cpu_usage_data):
 
 def create_top_cpu_chart(data, worksheet, workbook):
     # 将数据写入工作表
-    id=2
+    id = 2
     worksheet.cell(row=1, column=12, value='instance')
     worksheet.cell(row=1, column=13, value='avg cpu')
     worksheet.cell(row=1, column=14, value='max cpu')
     instance_cpu_data = []
+    
     for row in data:
         cells = row.split(',')
         #selected_columns = [0,1, 2, 4,6]
@@ -214,12 +374,11 @@ def create_top_cpu_chart(data, worksheet, workbook):
     img.width = IMG_WIDTH
     img.height = IMG_HEIGHT
 
-
     # 将柱状图添加到工作表
     worksheet.add_image(img, "L16")
 
     # 保存 Excel 文件
-    workbook.save("rds_report.xlsx")
+    workbook.save("asv2_evaluation_report.xlsx")
 
 def create_jpg_bar_chart(data1,data2,data3):
     #data = [['instance1', 20, 20], ['instance2', 30, 20], ['instance3', 25, 20], ...]
@@ -303,7 +462,7 @@ def create_top_cost_saving_chart(data, worksheet, workbook):
     worksheet.add_image(img, "W16")
 
     # 保存 Excel 文件
-    workbook.save("rds_report.xlsx")
+    workbook.save("asv2_evaluation_report.xlsx")
 
 def create_cost_bar_jpg(data1,data2,data3):
     #data = [['instance1', 20, 20], ['instance2', 30, 20], ['instance3', 25, 20], ...]
@@ -404,7 +563,7 @@ def create_cpu_usage_distribution_chart(data, worksheet, workbook):
     worksheet.add_image(img, "A16")
 
     # 保存 Excel 文件
-    workbook.save("rds_report.xlsx")
+    workbook.save("asv2_evaluation_report.xlsx")
 
 def update_progress(current_step, total_steps):
     """
@@ -444,308 +603,241 @@ def aws_region_to_location(region):
     else:
         return "Unknown location"
 
-def main():
-    output_result=[]
+def process_instance(instance, instance_count):
+    global counter
     avg_cpu_list=[]
-    #mrr_output_result=[]
-    output_result_chart=[]
+    counter += 1
+    update_progress(counter, instance_count)
+    logging.info("-----------------------")
+    instance_id = instance['DBInstanceIdentifier']
+    instance_class = instance['DBInstanceClass']
+    engine = instance['Engine'].replace("-", " ", 1)
+    engine_version = instance['EngineVersion']
+    status = instance['DBInstanceStatus']
+    availability_zone = instance['AvailabilityZone']
+    db_cluster_identifier = instance.get('DBClusterIdentifier', '')
+    account_id = instance['DBInstanceArn'].split(':')[4]
 
-    # MRR 1 年 RI total cost 变量
-    #mrr_sum_cost_1ynp=0
+    if engine == "postgres":
+        engine = engine.replace("postgres", "PostgreSQL")
 
-    # MRR total asv2 cost 变量
-    #mrr_sum_cost_asv2=0
+    product_json = pricing_get_product(engine=engine, serverless=False, instance_class=instance_class)
+    vcpu = product_json['product']['attributes']['vcpu']
 
-    # 获取 RDS 实例列表
-    rds = boto3.client('rds')
-    response = rds.describe_db_instances()
-    instance_list = response['DBInstances']
-    p=0
+    # 获取OD单价
+    for offer_term_code, offer_term_data in product_json['terms']["OnDemand"].items():
+        for price_dimension_code, price_dimension_data in offer_term_data["priceDimensions"].items():
+            od_price_per_unit = round(float(price_dimension_data["pricePerUnit"]["USD"]), 3)
+            logging.info(f"OD Price per unit: {od_price_per_unit}")
 
-    for instance in instance_list:
-        update_progress(p + 1, len(instance_list))
-        p=p+1
-        logging.info("-----------------------")
-        instance_id = instance['DBInstanceIdentifier']
-        instance_class = instance['DBInstanceClass']
-        engine = instance['Engine'].replace("-", " ", 1)
-        engine_version = instance['EngineVersion']
-        status = instance['DBInstanceStatus']
-        availability_zone = instance['AvailabilityZone']
-        db_cluster_identifier = instance.get('DBClusterIdentifier', '')
-        account_id = instance['DBInstanceArn'].split(':')[4]
+    # 获取1 year no upfront的单价
+    if 'Reserved' in product_json['terms']:
+        for offer_term_code, offer_term_data in product_json['terms']["Reserved"].items():
+            if offer_term_data["termAttributes"]["LeaseContractLength"] == "1yr" and offer_term_data["termAttributes"][
+                "PurchaseOption"] == "No Upfront":
+                for price_dimension_code, price_dimension_data in offer_term_data["priceDimensions"].items():
+                    noup_1yr_price_per_unit = round(float(price_dimension_data["pricePerUnit"]["USD"]), 3)
+                    logging.info(f"No upfront 1 year Price per unit: {noup_1yr_price_per_unit}")
+    else:
+        logging.info("'Reserved' node not found in product_json['terms']")
+        noup_1yr_price_per_unit = 0
 
-        if engine == 'aurora mysql' or engine == 'aurora postgresql' or engine == 'mysql' or engine == 'postgres':
-            pass
-        else:
-            continue
+    # 获取3 year all upfront的单价
+    if 'Reserved' in product_json['terms']:
+        for offer_term_code, offer_term_data in product_json['terms']["Reserved"].items():
+            if offer_term_data["termAttributes"]["LeaseContractLength"] == "3yr" and offer_term_data["termAttributes"][
+                "PurchaseOption"] == "All Upfront":
+                for price_dimension_code, price_dimension_data in offer_term_data["priceDimensions"].items():
+                    if price_dimension_data["unit"] == "Quantity":
+                        allup_3yr_price_per_unit = round(float(price_dimension_data["pricePerUnit"]["USD"]) / 36 / 720,
+                                                         3)
+                        logging.info(f"All upfront 3 year Price per unit: {allup_3yr_price_per_unit}")
+    else:
+        logging.info("'Reserved' node not found in product_json['terms']")
+        allup_3yr_price_per_unit = 0
 
-        if instance_class == 'db.serverless':
-            continue
+    # 获取acu的单价
+    price_per_acu_hour = get_aurora_serverless_acu_price(engine,rds_region)
+    logging.info(f"Price per ACU-Hour: {price_per_acu_hour}")
 
-        if engine == "postgres":
-            engine = engine.replace("postgres", "PostgreSQL")
+    # 获取最近1月的CPU 使用率情况
+    cpu_utils = get_cpu_utilization(instance_id, rds_region)  # get avg/min/max and percent in one shot
+    avg_cpu_util = math.ceil(cpu_utils.get('cpu_avg')['values'][0])
+    if avg_cpu_util is not None:
+        logging.info(f"Average CPU Utilization (1 week): {avg_cpu_util:.2f}%")
+    else:
+        logging.info("No CPU utilization data available")
 
-# 计算数据库实例使用的 storage 使用的情况
-        volume_bytes_used_gb = 0
-        if engine.startswith('aurora-'):
-            cloudwatch = boto3.client('cloudwatch')
-            response = cloudwatch.get_metric_statistics(
-                Namespace='AWS/RDS',
-                MetricName='VolumeBytesUsed',
-                StartTime=datetime.utcnow() - timedelta(hours=4),
-                EndTime=datetime.utcnow(),
-                Period=3600,
-                Statistics=['Average'],
-                Dimensions=[
-                    {
-                        'Name': 'DBClusterIdentifier',
-                        'Value': db_cluster_identifier
-                    }
-                ]
-            )
-            if response['Datapoints']:
-                volume_bytes_used = response['Datapoints'][0]['Average']
-                volume_bytes_used_gb = volume_bytes_used / (1024 ** 3)
+    min_cpu_util = math.ceil(cpu_utils.get('cpu_min')['values'][0])
+    if min_cpu_util is not None:
+        logging.info(f"Minimum CPU Utilization (1 week): {min_cpu_util:.2f}%")
+    else:
+        logging.info("No CPU utilization data available")
 
-        logging.info(f"Instance ID: {instance_id}")
-        logging.info(f"Instance Type: {instance_class}")
-        logging.info(f"Engine: {engine}-{engine_version}")
-        logging.info(f"Status: {status}")
-        logging.info(f"Availability Zone: {availability_zone}")
-        logging.info(f"VolumeBytesUsed: {volume_bytes_used_gb:.2f} GB")
+    max_cpu_util =  math.ceil(cpu_utils.get('cpu_max')['values'][0])
+    if max_cpu_util is not None:
+        logging.info(f"Maximum CPU Utilization (1 week): {max_cpu_util:.2f}%")
+    else:
+        logging.info("No CPU utilization data available")
 
-
-        pricing = boto3.client('pricing',region_name='us-east-1')
-
-        #location_name = 'Asia Pacific (Tokyo)'
-
-        response = pricing.get_products(
-            ServiceCode='AmazonRDS',
-            Filters=[
-                {'Type': 'TERM_MATCH', 'Field': 'databaseEngine', 'Value': engine},
-                {'Type': 'TERM_MATCH', 'Field': 'instanceType', 'Value': instance_class},
-                {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': aws_region_to_location(rds_region)},
-                {'Type': 'TERM_MATCH', 'Field': 'deploymentOption', 'Value': 'Single-AZ'},
-                {'Type': 'TERM_MATCH', 'Field': 'storage', 'Value': 'EBS Only'}
-            ]
-        )
-        #logging.info(json.dumps(response, indent=4))
-        product_json = json.loads(response['PriceList'][0])
-        #logging.info(json.dumps(product_json, indent=4))
-        vcpu = product_json['product']['attributes']['vcpu']
-
-        #获取OD单价
-        for offer_term_code, offer_term_data in product_json['terms']["OnDemand"].items():
-            for price_dimension_code, price_dimension_data in offer_term_data["priceDimensions"].items():
-                od_price_per_unit = round(float(price_dimension_data["pricePerUnit"]["USD"]),3)
-                logging.info(f"OD Price per unit: {od_price_per_unit}")
-        #logging.info(f"vcpu:{vcpu}")
-
-        #获取1 year no upfront的单价
-        if 'Reserved' in product_json['terms']:
-            for offer_term_code, offer_term_data in product_json['terms']["Reserved"].items():
-                if offer_term_data["termAttributes"]["LeaseContractLength"] == "1yr" and offer_term_data["termAttributes"]["PurchaseOption"] == "No Upfront":
-                    for price_dimension_code, price_dimension_data in offer_term_data["priceDimensions"].items():
-                        noup_1yr_price_per_unit = round(float(price_dimension_data["pricePerUnit"]["USD"]),3)
-                        logging.info(f"No upfront 1 year Price per unit: {noup_1yr_price_per_unit}")
-        else:
-            logging.info("'Reserved' node not found in product_json['terms']")
-            noup_1yr_price_per_unit = 0
-
-        #获取3 year all upfront的单价
-        if 'Reserved' in product_json['terms']:
-            for offer_term_code, offer_term_data in product_json['terms']["Reserved"].items():
-                if offer_term_data["termAttributes"]["LeaseContractLength"] == "3yr" and offer_term_data["termAttributes"]["PurchaseOption"] == "All Upfront":
-                    for price_dimension_code, price_dimension_data in offer_term_data["priceDimensions"].items():
-                        if price_dimension_data["unit"] == "Quantity":
-                            allup_3yr_price_per_unit = round(float(price_dimension_data["pricePerUnit"]["USD"])/36/720,3)
-                            logging.info(f"All upfront 3 year Price per unit: {allup_3yr_price_per_unit}")
-        else:
-            logging.info("'Reserved' node not found in product_json['terms']")
-            allup_3yr_price_per_unit = 0
-
-        #获取acu的单价
-        price_per_acu_hour = get_aurora_serverless_acu_price(engine)
-        logging.info(f"Price per ACU-Hour: {price_per_acu_hour}")
-
-        # 获取最近1周的CPU 使用率情况 
-        avg_cpu_util = get_cpu_utilization(instance_id, rds_region, stat='Average')
-        #print ("avg_cpu_util",avg_cpu_util)
+    od_monthly_cost = round(730*od_price_per_unit,3)
+    ri_1yr_no = round(730*noup_1yr_price_per_unit,3)
+    ri_3yr_all = round(730*allup_3yr_price_per_unit,3)
         
-        if avg_cpu_util is not None:
-            logging.info(f"Average CPU Utilization (1 week): {avg_cpu_util:.2f}%")
-        else:
-            logging.info("No CPU utilization data available")
+    ## Q：下面的公式要除以 100 是为了将利用率转换为正常可计算的数值
+    #print ("before min acu",(avg_cpu_util+min_cpu_util)/100/2*int(vcpu)*4)
+    before_min_acu = (avg_cpu_util+min_cpu_util)/100/2*int(vcpu)*4
+    if before_min_acu <= 0.5:
+        min_acu = 0.5
+    else:
+        min_acu = math.ceil((avg_cpu_util+min_cpu_util)/100/2*int(vcpu)*4) 
+    #print ("min_acu",min_acu)
+    ## Q: 同上
+    before_avg_acu=avg_cpu_util/100*int(vcpu)*4
+    if before_avg_acu <=0.5:
+        avg_acu = 0.5
+    else:
+        avg_acu = math.ceil(avg_cpu_util/100*int(vcpu)*4)
+    #print('avg acu',avg_acu,"before_avg_acu",before_avg_acu,"avg_cpu_util",avg_cpu_util)
+    asv2_cost_1 = avg_acu*730*price_per_acu_hour
+    sum_exceed_mincpu_cost = 0
 
-        min_cpu_util = get_cpu_utilization(instance_id, rds_region, stat='Minimum')
-        if min_cpu_util is not None:
-            logging.info(f"Minimum CPU Utilization (1 week): {min_cpu_util:.2f}%")
-        else:
-            logging.info("No CPU utilization data available")
+    # 获取CPU 使用率超过MinACU的数据(=CPU%>(AVG+MIN)/2)
+    minacu_cpu=(avg_cpu_util+min_cpu_util)/2
+    high_cpu_data = cpu_utils['cpu_percent']
+    if high_cpu_data:
+        timestamps = high_cpu_data['timestamps']
+        values = high_cpu_data['values']
+        timestamps.reverse()
+        first_time = timestamps[0]
+        last_time = timestamps[-1]
+        values.reverse()
+        all_values = values
+        exceed_minacu_value_cnt = 0
+        logging.info(f"all values cnt : {len(all_values)}")
 
-        max_cpu_util = get_cpu_utilization(instance_id, rds_region, stat='Maximum')
-        if max_cpu_util is not None:
-            logging.info(f"Maximum CPU Utilization (1 week): {max_cpu_util:.2f}%")
-        else:
-            logging.info("No CPU utilization data available")
+        # 计算弹性费用，超过MinACU的情况
+        for i in range(len(timestamps)):
+            if values[i] > minacu_cpu:
+                exceed_mincpu_cost = (math.ceil(values[i] / 100 * int(vcpu) * 4) - min_acu) * price_per_acu_hour / 60
+                sum_exceed_mincpu_cost = sum_exceed_mincpu_cost + exceed_mincpu_cost
+                exceed_minacu_value_cnt = exceed_minacu_value_cnt + 1
 
-        od_monthly_cost = round(730*od_price_per_unit,3)
-        ri_1yr_no = round(730*noup_1yr_price_per_unit,3)
-        ri_3yr_all = round(730*allup_3yr_price_per_unit,3)
+        logging.info(f"CPU Utilization > {minacu_cpu}%: total {exceed_minacu_value_cnt}, only logging.info 10 samples")
+        p_cnt = 0
+        for i in range(len(timestamps)):
+            if values[i] > minacu_cpu:
+                logging.info(f"{timestamps[i].strftime('%Y-%m-%dT%H:%M:%SZ')} - {values[i]}%")
+                p_cnt = p_cnt + 1
+                if p_cnt == 10:
+                    break
         
-        ## Q：下面的公式要除以 100 是为了将利用率转换为正常可计算的数值
-        print ("before min acu",(avg_cpu_util+min_cpu_util)/100/2*int(vcpu)*4)
-        before_min_acu = (avg_cpu_util+min_cpu_util)/100/2*int(vcpu)*4
-        if before_min_acu <= 0.5:
-            min_acu = 0.5
-        else:
-            min_acu = math.ceil((avg_cpu_util+min_cpu_util)/100/2*int(vcpu)*4) 
-        print ("min_acu",min_acu)
-        ## Q: 同上
-        before_avg_acu=avg_cpu_util/100*int(vcpu)*4
-        if before_avg_acu <=0.5:
-            avg_acu = 0.5
-        else:
-            avg_acu = math.ceil(avg_cpu_util/100*int(vcpu)*4)
-        print('avg acu',avg_acu,"before_avg_acu",before_avg_acu,"avg_cpu_util",avg_cpu_util)
-        asv2_cost_1 = avg_acu*730*price_per_acu_hour
-        sum_exceed_mincpu_cost = 0
-
-        # 获取CPU 使用率超过MinACU的数据(=CPU%>(AVG+MIN)/2)
-        minacu_cpu=(avg_cpu_util+min_cpu_util)/2
-        print ("minacu_cpu",minacu_cpu)
-        cloudwatch = boto3.client('cloudwatch', region_name=rds_region)
-        response = cloudwatch.get_metric_data(
-            MetricDataQueries=[
-                {
-                    'Id': 'm3',
-                    'Expression': f'IF(m1>0,m1)',
-                    'Label': 'CPU Watch'
-                },
-                {
-                    'Id': 'm1',
-                    'MetricStat': {
-                        'Metric': {
-                            'Namespace': 'AWS/RDS',
-                            'MetricName': 'CPUUtilization',
-                            'Dimensions': [
-                                {
-                                    'Name': 'DBInstanceIdentifier',
-                                    'Value': instance_id
-                                }
-                            ]
-                        },
-                        'Period': 60,
-                        'Stat': 'Maximum',
-                        'Unit': 'Percent'
-                    },
-                    'ReturnData': False
-                }
-            ],
-            StartTime=datetime.utcnow() - timedelta(days=30),
-            EndTime=datetime.utcnow()
-        )
-        if response['MetricDataResults']:
-            high_cpu_data = response['MetricDataResults'][0]
-            timestamps = high_cpu_data['Timestamps']
-            values = high_cpu_data['Values']
-            timestamps.reverse()
-            first_time = datetime.fromisoformat(str(timestamps[0])).strftime('%Y-%m-%d')
-            last_time = datetime.fromisoformat(str(timestamps[-1])).strftime('%Y-%m-%d')
-            values.reverse()
-            all_values = values
-            exceed_minacu_value_cnt = 0
-            logging.info(f"all values cnt : {len(all_values)}")
-
-            #计算弹性费用，超过MinACU的情况
-            for i in range(len(timestamps)):
-                if values[i] > minacu_cpu:
-                    ## Q: 同上，values[i] 除以 100 是为了转换成可计算的数值
-                    exceed_mincpu_cost = (math.ceil(values[i]/100*int(vcpu)*4)-min_acu)*price_per_acu_hour/60
-                    sum_exceed_mincpu_cost = sum_exceed_mincpu_cost + exceed_mincpu_cost
-                    exceed_minacu_value_cnt = exceed_minacu_value_cnt + 1
-
-            logging.info(f"CPU Utilization > {minacu_cpu}%: total {exceed_minacu_value_cnt}, only logging.info 10 samples")
-            p_cnt = 0
-
-            for i in range(len(timestamps)):
-                if values[i] > minacu_cpu:
-                    logging.info(f"{timestamps[i].strftime('%Y-%m-%dT%H:%M:%SZ')} - {values[i]}%")
-                    p_cnt = p_cnt + 1
-                    if p_cnt == 10:
-                        break
-
         asv2_cost_2 = round(min_acu*price_per_acu_hour*730+sum_exceed_mincpu_cost,3)
-        print ("min_acu",min_acu,"min_acu*price_per_acu_hour*730",min_acu*price_per_acu_hour*730,"sum_exceed_mincpu_cost",sum_exceed_mincpu_cost)
+        #print ("min_acu",min_acu,"min_acu*price_per_acu_hour*730",min_acu*price_per_acu_hour*730,"sum_exceed_mincpu_cost",sum_exceed_mincpu_cost)
 
         save_cost_1_percent = round((ri_1yr_no - asv2_cost_1)/ri_1yr_no,3)
         save_cost_1_format = "{:.1%}".format(save_cost_1_percent)
         save_cost_2_percent = round((ri_1yr_no - asv2_cost_2)/ri_1yr_no,3)
         save_cost_2_format = "{:.1%}".format(save_cost_2_percent)
         avg_cpu_list.append(avg_cpu_util)
+    # return avg_cpu_util, output_result, output_result_chart
+    return (avg_cpu_util,
+            f"{account_id},{rds_region},{instance_id},{engine},{engine_version},{instance_class},{vcpu},{avg_cpu_util},{min_cpu_util},{max_cpu_util},{first_time},{last_time},{od_monthly_cost},{ri_1yr_no},{ri_3yr_all},{min_acu},{price_per_acu_hour},{asv2_cost_1},{asv2_cost_2},{save_cost_1_format},{save_cost_2_format}",
+            f"{rds_region},{instance_id},{engine},{engine_version},{instance_class},{vcpu},{avg_cpu_util},{min_cpu_util},{max_cpu_util},{first_time},{last_time},{od_price_per_unit},{od_monthly_cost},{noup_1yr_price_per_unit},{ri_1yr_no},{allup_3yr_price_per_unit},{ri_3yr_all},{min_acu},{price_per_acu_hour},{asv2_cost_1},{asv2_cost_2},{save_cost_1_percent},{save_cost_2_percent}")
 
-        # 当 save_cost_2_percent 列，当 >0 时，将 1 年 ri 无预付的列以及 asv2 sum 的值分别求和
-        #if save_cost_2_percent > 0:
-        #    mrr_sum_cost_1ynp=mrr_sum_cost_1ynp+ri_1yr_no
-        #    mrr_sum_cost_asv2=mrr_sum_cost_asv2+asv2_cost_2
-        #print ("成本对比",mrr_sum_cost_1ynp,mrr_sum_cost_asv2)
+def main():
+    output_result=[]
+    avg_cpu_list=[]
+    output_result_chart=[]
+    rds = boto3.client('rds')
+    marker = None
+    all_filtered_instances = []
 
-        output_result.append(f"{account_id},{rds_region},{instance_id},{engine},{engine_version},{instance_class},{vcpu},{avg_cpu_util},{min_cpu_util},{max_cpu_util},{first_time},{last_time},{od_monthly_cost},{ri_1yr_no},{ri_3yr_all},{min_acu},{price_per_acu_hour},{asv2_cost_1},{asv2_cost_2},{save_cost_1_format},{save_cost_2_format}")
-        output_result_chart.append(f"{rds_region},{instance_id},{engine},{engine_version},{instance_class},{vcpu},{avg_cpu_util},{min_cpu_util},{max_cpu_util},{first_time},{last_time},{od_price_per_unit},{od_monthly_cost},{noup_1yr_price_per_unit},{ri_1yr_no},{allup_3yr_price_per_unit},{ri_3yr_all},{min_acu},{price_per_acu_hour},{asv2_cost_1},{asv2_cost_2},{save_cost_1_percent},{save_cost_2_percent}")
+    while True:
+        if marker:
+            instance_response = rds.describe_db_instances(Marker=marker)
+        else:
+            instance_response = rds.describe_db_instances()
+        
+        instances = instance_response['DBInstances']
+        filtered = [
+            instance for instance in instances
+            if instance['Engine'] in ['aurora-mysql', 'aurora-postgresql', 'mysql', 'postgres']
+            and instance['DBInstanceClass'] != 'db.serverless'
+        ]
+        all_filtered_instances.extend(filtered)
+        
+        if 'Marker' in instance_response:
+            marker = instance_response['Marker']
+        else:
+            break
 
-        logging.info("-----------------------")
-    
+    # 一次获取该 region 下的 rds 及 aurora 所有产品的 price
+    pricing_get_products_optimized(rds_region)
+
+    # 分批处理实例（每批50个）
+    batch_size = 2
+    total_instances = len(all_filtered_instances)
+    total_batches = (total_instances + batch_size - 1) // batch_size  # 向上取整
+
+    print(f"######## 总批次为 {total_batches}, 共计 {total_instances} 个实例 ########")
+    # 处理每一批实例
+    for batch_idx in range(total_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, total_instances)
+        batch_instances = all_filtered_instances[start_idx:end_idx]
+        print(f"######## 开始处理第 {batch_idx+1}/{total_batches} 批次, 实例 {start_idx+1} ~ {end_idx}/{total_instances} ########")
+        
+        # 使用50个并发线程处理当前批次的实例
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            tasks = [
+                executor.submit(process_instance, instance, total_instances)
+                for instance in batch_instances
+            ]
+            
+            # 等待所有任务完成，并处理结果
+            for future in concurrent.futures.as_completed(tasks):
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    print(f"处理实例时出错: {e}")
+        
+        # 可以在这里处理当前批次的结果（如保存到文件）
+        print(f"批次 {batch_idx+1} 处理完成，成功处理 {len(results)} 个实例")
+
+    # 处理数据
+    for result in results:
+        avg_cpu_list.append(result[0])
+        output_result.append(result[1])
+        output_result_chart.append(result[2])
     output_column = "account_id,region,instance id,engine,engine_version,instace type,vcpu,CPU Avg Util%,CPU Min Util%,CPU Max Util%,StartTime,EndTime,Ondemand/monthly,1 YR NP/monthly,3 YR AP/monthly,Min ACU,ASv2 Price/h,ASV2 Cost 1/monthly,ASV2 Cost 2/monthly,Save Percent 1, Save Percent 2"
-    logging.info("The evaluation results are as follows. It is recommended to copy and paste them into Excel for reading.")
+    logging.info(
+        "The evaluation results are as follows. It is recommended to copy and paste them into Excel for reading.")
     logging.info(f"{output_column}")
-    
-    # 计算 asv2 和 1ynp MRR 成本差异
-    #mrr_sum_save= round((mrr_sum_cost_1ynp-mrr_sum_cost_asv2),2)
-    #split_columns = output_column.split(',')
-    #mrr_column_count = len(split_columns)+2
-    #mrr_output_result.append(f"{mrr_sum_cost_1ynp},{mrr_sum_cost_asv2},{mrr_sum_save}")
-    #mrr_output_column = "Sum(Ondemand Save Percent 2>0),Sum of(ASV2 Cost 2),ASV2 Cost Savings (Save Percent 2> 0)"
 
-    top_cpu_output_result = sorted(output_result_chart, key=lambda x: int(x.split(',')[6]), reverse=True)[:8]
+    # logger.info(f'debug for output_result_chart: {json.dumps(output_result_chart, indent=2)}')
+    top_cpu_output_result = sorted(output_result_chart, key=lambda x: float(x.split(',')[6]), reverse=True)[:8]
     top_cost_save_output_result = sorted(output_result_chart, key=lambda x: float(x.split(',')[22]), reverse=True)[:8]
     create_cpu_usage_distribution_chart(count_cpu_usage_distribution(avg_cpu_list), myworksheet, myworkbook)
-    create_top_cpu_chart(top_cpu_output_result,myworksheet,myworkbook)
-    create_top_cost_saving_chart(top_cost_save_output_result,myworksheet,myworkbook)
+    create_top_cpu_chart(top_cpu_output_result, myworksheet, myworkbook)
+    create_top_cost_saving_chart(top_cost_save_output_result, myworksheet, myworkbook)
     for line in top_cost_save_output_result:
         logging.info(line)
 
     output_df = pd.DataFrame([row.split(',') for row in output_result], columns=output_column.split(','))
-    #mrr_output_df = pd.DataFrame([row.split(',') for row in mrr_output_result], columns=mrr_output_column.split(','))
 
     myworksheet_detail = myworkbook.create_sheet("Detail")
-    
+
     column_names = output_column.split(",")
     df = pd.DataFrame([line.split(",") for line in output_result], columns=column_names)
     myworksheet_detail.append(column_names)
     for row in df.itertuples(index=False):
         myworksheet_detail.append(row)
-    
-    #mrr_column_names = mrr_output_column.split(",")
-    #mrr_df = pd.DataFrame([line.split(",") for line in mrr_output_result], columns=mrr_column_names)
-   
-    # 写入 mrr_df 的列名，从第 23 列开始，底纹为淡绿色
-    #start_col = mrr_column_count
-    #header_font = Font(bold=True)
-    #light_green_fill = PatternFill(start_color='90EE90', end_color='90EE90', fill_type='solid')
-    #for col_idx, col_name in enumerate(mrr_column_names, start=start_col):
-    #    cell = myworksheet_detail.cell(row=1, column=col_idx, value=col_name)
-    #    cell.font = header_font
-    #    cell.fill = light_green_fill
 
-    # 写入 mrr_df 的数据，从第 23 列开始，底纹为淡绿色
-    #for row_num, row in enumerate(mrr_df.values, start=2):
-    #    for col_idx, value in enumerate(row, start=start_col):
-    #        cell = myworksheet_detail.cell(row=row_num, column=col_idx, value=value)
-    #        cell.fill = light_green_fill
-    # 保存 Excel 文件
+    # 结果保存到 xlsx 文件中
     myworkbook.save("asv2_evaluation_report.xlsx")
-
 
 if __name__ == "__main__":
     try:
