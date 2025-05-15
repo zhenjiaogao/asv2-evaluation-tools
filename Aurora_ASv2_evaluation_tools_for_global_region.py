@@ -90,7 +90,7 @@ def get_cpu_utilization(instance_id, region):
                             }
                         ]
                     },
-                    'Period': 86400 * 31,  # 注意：这么大的周期可能会导致数据点不足
+                    'Period': 86400 * 31, 
                     'Stat': 'Average'
                 },
                 'ReturnData': True
@@ -133,9 +133,8 @@ def get_cpu_utilization(instance_id, region):
             },
             {
                 'Id': 'cpu_percent',
-                'Expression': 'IF(m1>0,m1)',  # 修正：移除 f-string（不需要）
-                'Label': 'CPU Watch',
-                'ReturnData': True  # 添加缺失的 ReturnData
+                'Expression': 'IF(m1>0,m1)', 
+                'Label': 'CPU Watch'
             },
             {
                 'Id': 'm1',
@@ -150,14 +149,14 @@ def get_cpu_utilization(instance_id, region):
                             }
                         ]
                     },
-                    'Period': 60,  # 每分钟一个数据点（更合理）
+                    'Period': 60,  
                     'Stat': 'Maximum',
                     'Unit': 'Percent'
                 },
                 'ReturnData': False
             }
         ],
-        # 修正参数名称为 CamelCase
+      
         StartTime=(datetime.utcnow() - timedelta(days=30)).isoformat() + 'Z',
         EndTime=datetime.utcnow().isoformat() + 'Z'
     )
@@ -807,11 +806,12 @@ def main():
         # 可以在这里处理当前批次的结果（如保存到文件）
         print(f"批次 {batch_idx+1} 处理完成，成功处理 {len(results)} 个实例")
 
-    # 处理数据
-    for result in results:
-        avg_cpu_list.append(result[0])
-        output_result.append(result[1])
-        output_result_chart.append(result[2])
+        # 处理数据
+        for result in results:
+            avg_cpu_list.append(result[0])
+            output_result.append(result[1])
+            output_result_chart.append(result[2])
+            
     output_column = "account_id,region,instance id,engine,engine_version,instace type,vcpu,CPU Avg Util%,CPU Min Util%,CPU Max Util%,StartTime,EndTime,Ondemand/monthly,1 YR NP/monthly,3 YR AP/monthly,Min ACU,ASv2 Price/h,ASV2 Cost 1/monthly,ASV2 Cost 2/monthly,Save Percent 1, Save Percent 2"
     logging.info(
         "The evaluation results are as follows. It is recommended to copy and paste them into Excel for reading.")
