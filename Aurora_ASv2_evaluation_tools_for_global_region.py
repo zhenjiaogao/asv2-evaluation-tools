@@ -685,18 +685,18 @@ def process_instance(instance, instance_count):
         
     ## Q：下面的公式要除以 100 是为了将利用率转换为正常可计算的数值
     #print ("before min acu",(avg_cpu_util+min_cpu_util)/100/2*int(vcpu)*4)
-    before_min_acu = (avg_cpu_util+min_cpu_util)/100/2*int(vcpu)*4
-    if before_min_acu <= 0.5:
-        min_acu = 0.5
-    else:
-        min_acu = math.ceil((avg_cpu_util+min_cpu_util)/100/2*int(vcpu)*4) 
+    #before_min_acu = (avg_cpu_util+min_cpu_util)/100/2*int(vcpu)*4
+    #if before_min_acu <= 0.5:
+    #    min_acu = 0.5
+    #else:
+    min_acu = math.ceil((avg_cpu_util+min_cpu_util)/100/2*int(vcpu)*4) 
     #print ("min_acu",min_acu)
     ## Q: 同上
-    before_avg_acu=avg_cpu_util/100*int(vcpu)*4
-    if before_avg_acu <=0.5:
-        avg_acu = 0.5
-    else:
-        avg_acu = math.ceil(avg_cpu_util/100*int(vcpu)*4)
+    #before_avg_acu=avg_cpu_util/100*int(vcpu)*4
+    #if before_avg_acu <=0.5:
+    #    avg_acu = 0.5
+    #else:
+    avg_acu = math.ceil(avg_cpu_util/100*int(vcpu)*4)
     #print('avg acu',avg_acu,"before_avg_acu",before_avg_acu,"avg_cpu_util",avg_cpu_util)
     asv2_cost_1 = avg_acu*730*price_per_acu_hour
     sum_exceed_mincpu_cost = 0
