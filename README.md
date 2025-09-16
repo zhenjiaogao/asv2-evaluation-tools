@@ -85,4 +85,13 @@ python3 Aurora_ASv2_evaluation_tools_for_global_region.py
 | Save Percent 1 | ASV2 Cost 1 比 1 YR NP 成本低的百分比 |
 | Save Percent 2 | ASV2 Cost 2 比 1 YR NP 成本低的百分比 |
 
-
+## FAQ
+1. 工具使用了哪些API调用，是否会产生相关费用？
+     主要使用 Pricing 和 CloudWatch 模块的API：
+     
+     * pricing.get_products
+     * cloudwatch.get_metric_data
+     * cloudwatch.get_metric_statistics
+     
+     其中 cloudwatch.get_metric_data以及 cloudwatch.get_metric_statistics 每 1000 个请求的指标 USD 0.01 ，其他API请求 100 万次以内调用免费。更多 API 定价参考：
+     https://aws.amazon.com/cn/cloudwatch/pricing/?nc1=h_ls
