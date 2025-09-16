@@ -6,7 +6,7 @@
 
 ## 简介
 
-通过自动化的方式采集目标 Region 下的数据库实例的 CPU 使用率，Throughput 以及 Latency 等基础数据，以及实例价格信息，分别从成本以及性能的角度帮助客户评估 Provision 实例迁移到 ASv2 的可行性。ASv2 Evaluation Tool 以 CPU 利用率为主要判断依据，从成本的维度实现评估，并产出报表。ASv2 Performance Snapshot Tool 主要用于采集数据库实例的 Throughput 以及 Latency metrics，作为性能维度的基础判断数据。
+通过自动化的方式采集目标 Region 下的数据库实例的 CPU 使用率，Throughput 以及 Latency 等基础数据，以及实例价格信息，分别从成本以及性能的角度帮助客户评估 Provision 实例迁移到 ASv2 的可行性。ASv2 Evaluation Tool 以 CPU 利用率为主要判断依据，从成本的维度实现评估，并产出报表。
 
 当前版本仅支持 RDS MySQL/Postgresql 和 Aurora MySQL/Postgresql 四种实例。
 
