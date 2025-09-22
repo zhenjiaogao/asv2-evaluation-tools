@@ -18,9 +18,9 @@
 1. 资源准备
 * 1 台 EC2，1 核以上 ( 如 t2.micro)，Amazon 操作系统；与待评估数据库处于同一网络环境，或可访问到对应的 CloudWatch 服务
 * EC2 设置 API 访问权限，创建 IAM role，并授权
-      * AWSQuickSightDescribeRDS
-      * AWSPriceListServiceFullAccess
-      * CloudWatchReadOnlyAccess
+  * AWSQuickSightDescribeRDS
+  * AWSPriceListServiceFullAccess
+  * CloudWatchReadOnlyAccess
 2. 初始化环境
 * 安装 Python 3.8+：
   
